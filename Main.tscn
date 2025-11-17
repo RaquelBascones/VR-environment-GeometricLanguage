@@ -1,0 +1,1169 @@
+[gd_scene load_steps=2 format=3 uid="uid://cw6usjg1ekfhx"]
+
+[sub_resource type="GDScript" id="GDScript_rxg2q"]
+script/source = "extends Node3D
+
+# Cámara orbital + mesa + UI con:
+# - Lista de formas (Solo texto)
+# - Colores (10)
+# - Previsualización 3D fantasma
+# - Generar hasta 100 objetos en la mesa
+# - Borrar figura al hacer clic (con reorganización) o \"Delete all\"
+
+const MAX_SHAPES := 100 # Límite de figuras
+
+# === AJUSTES DE POSICIÓN DE LOS SLOTS ===
+const TABLE_HEIGHT := 0.08
+const TABLE_Y_POS := 0.82    # Centro de la malla de la tapa de la mesa.
+const FIGURE_CENTER_Y := 1.02
+const SLOT_Z_OFFSET := 0.0  
+
+# === TAMAÑO DE LA MESA (AUMENTADO) ===
+const TABLE_WIDTH := 4.4    
+const TABLE_DEPTH := 3.6    
+
+# -------- cámara orbital --------
+var cam: Camera3D
+var orbit_target := Vector3(0, 0.85, 0)
+var orbit_dist := 6.0
+var orbit_yaw := deg_to_rad(35.0)
+var orbit_pitch := deg_to_rad(20.0)
+var is_orbiting := false
+var is_panning := false
+
+# -------- Control de estado --------
+var is_deleting_mode := false # Controla si el ratón debe borrar figuras
+
+# -------- escena --------
+var table_top: MeshInstance3D
+var slots: Array[Vector3] = []
+var shapes: Array[Node3D] = []
+
+# -------- UI --------
+var ui_layer: CanvasLayer
+var side_panel: Panel
+var list_shapes: ItemList
+var opt_color: OptionButton
+var btn_generate: Button
+var btn_delete: Button         # Borrar todo
+var btn_toggle_delete: Button # Borrar elemento concreto (Modo Clic)
+
+# -------- preview 3D --------
+var ghost_preview_holder: Node3D = Node3D.new() # Contenedor del objeto fantasma
+var ghost_material: StandardMaterial3D 
+var table_top_material: StandardMaterial3D 
+
+# =========================================================
+## 🛠 READY
+# =========================================================
+func _ready():
+	# Fondo azul oscuro
+	RenderingServer.set_default_clear_color(Color(0.15, 0.17, 0.22))
+	_build_camera()
+	_build_light()
+	_build_room() 
+	_build_table() 
+	_build_slots()
+	_build_marker() 
+	
+	# 1. Crear material fantasma
+	_create_ghost_material()
+	
+	# 2. Añadir el holder fantasma al mundo principal
+	add_child(ghost_preview_holder)
+	
+	# 3. Construir la UI
+	_build_ui()
+	
+	# 4. Refrescar la primera previsualización
+	_refresh_preview()
+	
+	set_process_input(true)
+
+
+# =========================================================
+## 👻 PREVIEW FANTASMA
+# =========================================================
+
+func _create_ghost_material():
+	ghost_material = StandardMaterial3D.new() 
+	# Habilitar transparencia
+	ghost_material.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	ghost_material.albedo_color = Color(1, 1, 1, 0.4) # Blanco semi-transparente
+	ghost_material.roughness = 0.25 
+	ghost_material.metallic = 0.45 
+
+func _refresh_preview():
+	# 1. Eliminar el nodo anterior si existe
+	for child in ghost_preview_holder.get_children():
+		child.queue_free()
+	
+	# Si la lista de shapes aún no está lista, salimos
+	if list_shapes == null or list_shapes.get_item_count() == 0:
+		return
+	
+	var selected_items = list_shapes.get_selected_items()
+	if selected_items.is_empty():
+		return
+		
+	# 2. Crear la figura (con el shape y color seleccionados)
+	var shape_code: int = selected_items[0]
+	var color_id := opt_color.get_selected_id()
+	
+	# El preview no necesita colisión, solo la malla visual (MeshInstance3D)
+	var node := _make_shape_mesh(shape_code)
+	
+	# 3. Aplicar material fantasma y color
+	var c := _make_color_from_id(color_id)
+	ghost_material.albedo_color = Color(c.r, c.g, c.b, 0.4) # Aplicar color con transparencia
+	
+	if node is MeshInstance3D:
+		node.material_override = ghost_material
+
+	# 4. Escalar y ajustar posición vertical
+	node.scale = Vector3.ONE * 0.32
+	
+	if node is MeshInstance3D:
+		var mesh = node.mesh
+		if mesh is CylinderMesh:
+			# Ajuste vertical
+			if node.rotation.x == 0.0 and node.rotation.z == 0.0:
+				node.position.y += mesh.height / 2.0 * node.scale.y
+		elif mesh is BoxMesh:
+			# Ajuste vertical
+			node.position.y += mesh.size.y / 2.0 * node.scale.y
+		elif mesh is TorusMesh:
+			# Ajuste vertical para el Torus (mitad de su grosor, ajustado por rotación)
+			# Como ahora el MeshInstance3D está rotado 90 grados en X, usamos el outer_radius
+			node.position.y += mesh.outer_radius * node.scale.y
+	
+	# 5. Mover el contenedor a la posición del siguiente slot libre
+	_update_ghost_position()
+	
+	# 6. Añadir al holder
+	ghost_preview_holder.add_child(node)
+
+func _update_ghost_position():
+	var next_slot_index = shapes.size()
+	
+	if next_slot_index < slots.size():
+		# Posición en el siguiente slot libre
+		ghost_preview_holder.global_position = slots[next_slot_index]
+		ghost_preview_holder.visible = true
+	else:
+		# No quedan slots, se hace invisible
+		ghost_preview_holder.visible = false
+
+# =========================================================
+## 📐 CONSTRUCCIÓN DE ESCENA (SALÓN DE REUNIONES/TALLER)
+# =========================================================
+func _build_camera():
+	cam = Camera3D.new()
+	add_child(cam)
+	_update_camera_transform()
+	cam.current = true
+	cam.fov = 60
+
+func _build_light():
+	# 1. Luz Direccional (El Sol) - Simula la luz solar directa.
+	var sun := DirectionalLight3D.new()
+	add_child(sun)
+	# Rotación para que la luz entre por la ventana (lado derecho)
+	sun.rotation_degrees = Vector3(-45, 110, 0) 
+	sun.shadow_enabled = true
+	# Energía reducida para sombras suaves
+	sun.light_energy = 0.8 
+	sun.light_color = Color(1.0, 0.98, 0.95) 
+	sun.shadow_blur = 1.0 
+
+	# 2. Entorno del Mundo (Cielo Realista) - Domina la luz ambiental
+	var world_env := WorldEnvironment.new()
+	add_child(world_env)
+	var env := Environment.new()
+
+	# Usamos un cielo físico para luz ambiental exterior
+	env.background_mode = Environment.BG_SKY 
+	var procedural_sky := ProceduralSkyMaterial.new()
+	procedural_sky.sky_top_color = Color(0.3, 0.5, 0.8) # Azul del cielo
+	procedural_sky.sky_horizon_color = Color(0.8, 0.9, 1.0) # Horizonte claro
+	
+	# Ajustes globales de luz ambiental
+	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY # La luz ambiental viene del cielo
+	env.ambient_light_energy = 1.5 # Luz ambiental fuerte (luz de día suave)
+	env.ambient_light_color = Color(0.9, 0.95, 1.0) # Tono ligeramente frío/azul para la luz de relleno
+	
+	env.ssao_enabled = true 
+	env.ssao_radius = 1.0
+	
+	var sky := Sky.new()
+	sky.sky_material = procedural_sky
+	env.sky = sky
+	world_env.environment = env
+
+
+# --- FUNCIÓN _build_room() (Estantería, Ventana, Muebles y Detalles) ---
+func _build_room():
+	var room := Node3D.new()
+	add_child(room)
+	
+	# --- 1. Material del Suelo ---
+	var floor_mat := StandardMaterial3D.new()
+	floor_mat.albedo_color = Color(0.4, 0.45, 0.5) 
+	floor_mat.roughness = 0.4
+	floor_mat.metallic = 0.1 
+	
+	var open_simplex := FastNoiseLite.new() 
+	open_simplex.noise_type = FastNoiseLite.TYPE_SIMPLEX
+	open_simplex.frequency = 0.5 
+	open_simplex.fractal_octaves = 2 
+	var noise_tex := NoiseTexture2D.new() 
+	noise_tex.set_noise(open_simplex)
+	noise_tex.width = 512
+	noise_tex.height = 512
+	floor_mat.normal_enabled = true
+	floor_mat.normal_texture = noise_tex
+	floor_mat.normal_scale = 0.05 
+	
+	# --- 2. Suelo (Floor) ---
+	var ground := MeshInstance3D.new()
+	room.add_child(ground)
+	var plane := PlaneMesh.new()
+	plane.size = Vector2(20, 20)
+	ground.mesh = plane
+	ground.material_override = floor_mat
+	
+	# --- 3. Paredes (Back Wall, Side Wall con Ventana, y NUEVA Pared Oculta) ---
+	var wall_mat := StandardMaterial3D.new()
+	wall_mat.albedo_color = Color(0.9, 0.88, 0.85) # Color crema/beige muy claro
+	wall_mat.roughness = 0.7 
+	
+	var wall_mesh := BoxMesh.new()
+	
+	# Pared Trasera (Back Wall)
+	var back_wall := MeshInstance3D.new()
+	room.add_child(back_wall)
+	back_wall.mesh = wall_mesh
+	back_wall.scale = Vector3(15.0, 5.0, 0.1) 
+	back_wall.position = Vector3(0, 2.5, -9.95) 
+	back_wall.material_override = wall_mat
+	
+	# Pared Lateral con Ventana (Side Wall - CSG)
+	var side_wall_csg := CSGCombiner3D.new()
+	room.add_child(side_wall_csg)
+	side_wall_csg.global_position = Vector3(7.45, 2.5, 0) # Lado DERECHO
+	
+	var side_wall_base := CSGBox3D.new()
+	side_wall_base.size = Vector3(0.1, 5.0, 20.0)
+	side_wall_base.operation = CSGPrimitive3D.OPERATION_UNION
+	side_wall_base.material = wall_mat 
+	side_wall_csg.add_child(side_wall_base)
+	
+	# Hueco de la ventana (Hole)
+	var window_hole := CSGBox3D.new()
+	window_hole.size = Vector3(0.3, 2.0, 5.0) 
+	window_hole.operation = CSGPrimitive3D.OPERATION_SUBTRACTION
+	window_hole.position = Vector3(0, 0, 0) 
+	side_wall_csg.add_child(window_hole)
+	
+	# Pared Lateral Opuesta (Pared SIN ventana)
+	var opposite_wall := MeshInstance3D.new()
+	room.add_child(opposite_wall)
+	opposite_wall.mesh = wall_mesh
+	opposite_wall.scale = Vector3(0.1, 5.0, 20.0) 
+	opposite_wall.position = Vector3(-7.45, 2.5, 0) # Lado IZQUIERDO
+	opposite_wall.material_override = wall_mat
+	
+	# --- 4. Detalles de la Ventana (Fuera del CSG) ---
+	var window_details := Node3D.new()
+	room.add_child(window_details)
+	window_details.global_position = Vector3(7.45, 2.5, 0)
+
+	# Material de Cristal mejorado
+	var glass_mat := StandardMaterial3D.new()
+	glass_mat.albedo_color = Color(0.8, 0.9, 1.0, 0.08)
+	glass_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	glass_mat.roughness = 0.05
+	glass_mat.metallic = 0.5
+	glass_mat.clearcoat_enabled = true 
+	glass_mat.backface_cull = false 
+	
+	# Cristal y Marcos (Mullions)
+	var window_pane := MeshInstance3D.new()
+	window_details.add_child(window_pane)
+	window_pane.mesh = BoxMesh.new()
+	window_pane.scale = Vector3(0.15, 2.0, 5.0) 
+	window_pane.material_override = glass_mat
+
+	var frame_mat := StandardMaterial3D.new()
+	frame_mat.albedo_color = Color(0.1, 0.1, 0.1)
+	frame_mat.roughness = 0.7
+	
+	var horizontal_frame := MeshInstance3D.new()
+	window_details.add_child(horizontal_frame)
+	horizontal_frame.mesh = BoxMesh.new()
+	horizontal_frame.scale = Vector3(0.2, 0.05, 5.0)
+	horizontal_frame.position = Vector3(0, 0, 0)
+	horizontal_frame.material_override = frame_mat
+
+	var vertical_frame := MeshInstance3D.new()
+	window_details.add_child(vertical_frame)
+	vertical_frame.mesh = BoxMesh.new()
+	vertical_frame.scale = Vector3(0.2, 2.0, 0.05)
+	vertical_frame.position = Vector3(0, 0, 0)
+	vertical_frame.material_override = frame_mat
+	
+	# --- Cortinas Recogidas ---
+	var curtain_mat := StandardMaterial3D.new()
+	curtain_mat.albedo_color = Color(0.9, 0.85, 0.7, 0.8) 
+	curtain_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA 
+	curtain_mat.roughness = 0.9
+	
+	var curtain_left := MeshInstance3D.new()
+	window_details.add_child(curtain_left)
+	curtain_left.mesh = BoxMesh.new()
+	curtain_left.scale = Vector3(0.02, 2.5, 2.5) 
+	curtain_left.position = Vector3(0, 0, -1.25) 
+	curtain_left.material_override = curtain_mat
+
+	var curtain_right := MeshInstance3D.new()
+	window_details.add_child(curtain_right)
+	curtain_right.mesh = BoxMesh.new()
+	curtain_right.scale = Vector3(0.02, 2.5, 2.5)
+	curtain_right.position = Vector3(0, 0, 1.25) 
+	curtain_right.material_override = curtain_mat
+	
+	var curtain_top_center := MeshInstance3D.new()
+	window_details.add_child(curtain_top_center)
+	curtain_top_center.mesh = BoxMesh.new()
+	curtain_top_center.scale = Vector3(0.02, 0.5, 0.5) 
+	curtain_top_center.position = Vector3(0, 1.25, 0)
+	curtain_top_center.material_override = curtain_mat
+	
+	# --- 5. Pantalla/Pizarra ---
+	var screen_mesh := BoxMesh.new()
+	var screen := MeshInstance3D.new()
+	room.add_child(screen)
+	screen.mesh = screen_mesh
+	screen.scale = Vector3(8.0, 2.5, 0.05) 
+	screen.position = Vector3(0, 3.0, -9.8) 
+	
+	var screen_mat := StandardMaterial3D.new()
+	screen_mat.albedo_color = Color.BLACK
+	screen_mat.roughness = 0.1 
+	screen_mat.metallic = 0.0
+	screen.material_override = screen_mat
+	
+	# --- 6. (Espacio Anulado) ---
+	
+	# --- 7. Zona de Lectura (Sofá y Alfombra) ---
+	var reading_nook := Node3D.new()
+	room.add_child(reading_nook)
+	reading_nook.position = Vector3(6.0, 0, 7.3) 
+	
+	var sofa_mat := StandardMaterial3D.new()
+	sofa_mat.albedo_color = Color(0.8, 0.35, 0.1) 
+	sofa_mat.roughness = 0.85
+	
+	var sofa_length = 2.0
+	var armrest_offset = (sofa_length / 2.0) - 0.05
+	
+	var large_sofa := Node3D.new()
+	reading_nook.add_child(large_sofa)
+	large_sofa.position = Vector3(0.0, 0, 0) 
+	
+	var seat_base := MeshInstance3D.new()
+	large_sofa.add_child(seat_base)
+	seat_base.mesh = BoxMesh.new()
+	seat_base.scale = Vector3(sofa_length, 0.3, 0.8) 
+	seat_base.position = Vector3(0, 0.15, 0)
+	seat_base.material_override = sofa_mat
+	
+	var backrest := MeshInstance3D.new()
+	large_sofa.add_child(backrest)
+	backrest.mesh = BoxMesh.new()
+	backrest.scale = Vector3(sofa_length, 0.7, 0.1)
+	backrest.position = Vector3(0, 0.7, 0.35) 
+	backrest.material_override = sofa_mat
+	
+	var armrest_l := MeshInstance3D.new()
+	large_sofa.add_child(armrest_l)
+	armrest_l.mesh = BoxMesh.new()
+	armrest_l.scale = Vector3(0.1, 0.3, 0.8)
+	armrest_l.position = Vector3(-armrest_offset, 0.45, 0) 
+	armrest_l.material_override = sofa_mat
+	
+	var armrest_r := MeshInstance3D.new()
+	large_sofa.add_child(armrest_r)
+	armrest_r.mesh = BoxMesh.new()
+	armrest_r.scale = Vector3(0.1, 0.3, 0.8)
+	armrest_r.position = Vector3(armrest_offset, 0.45, 0) 
+	armrest_r.material_override = sofa_mat
+	
+	var small_rug := MeshInstance3D.new()
+	reading_nook.add_child(small_rug)
+	small_rug.mesh = PlaneMesh.new()
+	small_rug.scale = Vector3(3.0, 1.0, 2.0)
+	small_rug.position = Vector3(0.0, 0.005, -2.3)
+	small_rug.rotation_degrees = Vector3(0, 0, 0) 
+
+	var small_rug_mat := StandardMaterial3D.new()
+	small_rug_mat.albedo_color = Color(0.95, 0.9, 0.8) 
+	small_rug_mat.roughness = 0.95
+	small_rug.material_override = small_rug_mat
+
+	
+	# --- 8. Alfombra Central ---
+	var rug := MeshInstance3D.new()
+	room.add_child(rug)
+	rug.mesh = PlaneMesh.new()
+	rug.scale = Vector3(3.5, 1.0, 2.5)
+	rug.position = Vector3(0.0, 0.005, -7.0) 
+	rug.rotation_degrees = Vector3(0, 0, 0) 
+	
+	var rug_mat := StandardMaterial3D.new()
+	rug_mat.albedo_color = Color(0.6, 0.2, 0.2) 
+	rug_mat.roughness = 0.9
+	rug_mat.emission = Color(0.6, 0.2, 0.2) * 0.01 
+	rug.material_override = rug_mat
+
+	# --- 9. Obra de Arte Personalizada (Movida a la PARED DERECHA, ZONA DELANTERA) ---
+	
+	var art_container := Node3D.new()
+	room.add_child(art_container)
+	
+	# -----------------------------------------------------------------
+	# 📌 CÓDIGO CORREGIDO: MOVIDO A LA PARED DERECHA, ZONA DELANTERA
+	# -----------------------------------------------------------------
+	
+	# Posición: Cerca de la pared derecha (X=7.38), a 1.8m de altura.
+	# Z = -7.0 lo coloca en la zona delantera, lejos de la estantería (5.0) y antes de la ventana (0).
+	art_container.position = Vector3(7.38, 1.8, -7.0) 
+	
+	# Rotación: Rota -90 grados para mirar hacia X negativo (hacia la habitación)
+	art_container.rotation_degrees = Vector3(0, -90, 0) 
+	
+	# -----------------------------------------------------------------
+	
+	# ** REEMPLAZA ESTA RUTA POR LA RUTA REAL DE TU IMAGEN JPG **
+	const ART_IMAGE_PATH = \"res://images/super nenas.jpg\"
+	
+	var image_texture: Texture2D
+	
+	if FileAccess.file_exists(ART_IMAGE_PATH):
+		image_texture = load(ART_IMAGE_PATH)
+	else:
+		# Crea un placeholder si el archivo no existe
+		print(\"ADVERTENCIA: Archivo de arte no encontrado en la ruta: \", ART_IMAGE_PATH)
+		var white_image := Image.create(16, 16, false, Image.FORMAT_RGB8)
+		white_image.fill(Color.PURPLE) # Morado para que destaque
+		image_texture = ImageTexture.create_from_image(white_image)
+
+	# 9a. Material del Arte (El lienzo)
+	var art_mat := StandardMaterial3D.new()
+	art_mat.albedo_color = Color.WHITE
+	art_mat.albedo_texture = image_texture
+	art_mat.roughness = 0.9
+	art_mat.metallic = 0.0
+	
+	# 9b. Geometría del Arte (Lienzo delgado)
+	var art_mesh := MeshInstance3D.new()
+	art_container.add_child(art_mesh)
+	art_mesh.mesh = BoxMesh.new()
+	
+	# Escala: Cuadro Grande (ejemplo: 2.0m de ancho x 1.5m de alto)
+	var art_width = 2.0
+	var art_height = 1.5
+	var art_depth = 0.01 
+	
+	art_mesh.scale = Vector3(art_width, art_height, art_depth) 
+	art_mesh.position = Vector3(0, 0, 0.02) # Ligeramente adelantado
+	art_mesh.material_override = art_mat
+	
+	# 9c. Marco Negro (Frame)
+	var frame := MeshInstance3D.new()
+	art_container.add_child(frame)
+	frame.mesh = BoxMesh.new()
+	
+	var frame_thickness = 0.05 # Grosor del marco
+	
+	frame.scale = Vector3(art_width + frame_thickness, art_height + frame_thickness, 0.05)
+	frame.position = Vector3(0, 0, 0)
+	
+	# CORRECCIÓN DE ERROR: Cambiamos 'frame_mat' a 'art_frame_mat'
+	var art_frame_mat := StandardMaterial3D.new() 
+	art_frame_mat.albedo_color = Color(0.05, 0.05, 0.05) # Negro oscuro
+	art_frame_mat.roughness = 0.1
+	art_frame_mat.metallic = 0.1
+	frame.material_override = art_frame_mat
+	
+	# --- 10. Lámpara de Pie ---
+	var lamp_container := Node3D.new()
+	room.add_child(lamp_container)
+	lamp_container.position = Vector3(4.5, 0, 4.0) 
+	
+	# Materiales
+	var brass_mat := StandardMaterial3D.new()
+	brass_mat.albedo_color = Color(0.8, 0.7, 0.5) 
+	brass_mat.metallic = 0.8
+	brass_mat.roughness = 0.2
+	
+	var fabric_mat := StandardMaterial3D.new()
+	fabric_mat.albedo_color = Color(0.9, 0.9, 0.8) 
+	fabric_mat.roughness = 0.9
+	fabric_mat.emission = Color(0.9, 0.9, 0.8) * 0.4 
+	
+	# Base
+	var lamp_base := MeshInstance3D.new()
+	lamp_container.add_child(lamp_base)
+	var base_mesh := CylinderMesh.new()
+	base_mesh.top_radius = 0.15
+	base_mesh.bottom_radius = 0.15
+	base_mesh.height = 0.05
+	lamp_base.mesh = base_mesh
+	lamp_base.position = Vector3(0, 0.025, 0)
+	lamp_base.material_override = brass_mat
+	
+	# Poste
+	var lamp_post := MeshInstance3D.new()
+	lamp_container.add_child(lamp_post)
+	var post_mesh := CylinderMesh.new()
+	post_mesh.top_radius = 0.02
+	post_mesh.bottom_radius = 0.02
+	post_mesh.height = 1.8 
+	lamp_post.mesh = post_mesh
+	lamp_post.position = Vector3(0, 0.9, 0)
+	lamp_post.material_override = brass_mat
+	
+	# Pantalla (Shade)
+	var lamp_shade := MeshInstance3D.new()
+	lamp_container.add_child(lamp_shade)
+	var shade_mesh := CylinderMesh.new()
+	shade_mesh.top_radius = 0.2
+	shade_mesh.bottom_radius = 0.3
+	shade_mesh.height = 0.3
+	lamp_shade.mesh = shade_mesh
+	lamp_shade.position = Vector3(0, 1.8 + 0.15, 0) 
+	lamp_shade.material_override = fabric_mat
+	
+	# Luz puntual 
+	var point_light := OmniLight3D.new()
+	lamp_container.add_child(point_light)
+	point_light.light_color = Color(1.0, 0.9, 0.8) 
+	point_light.light_energy = 1.5
+	point_light.omni_range = 3.0
+	point_light.position = Vector3(0, 1.8, 0)
+	
+	# --- 11. (Espacio Anulado) ---
+
+	# --- 12. ESTANTERÍA ALTA Y MÁS GRANDE ---
+	var high_shelf_container := Node3D.new()
+	room.add_child(high_shelf_container)
+	
+	var shelf_width = 3.0 
+	var shelf_height = 2.5 
+	var shelf_depth = 0.5 
+	
+	high_shelf_container.position = Vector3(6.9, 0, 5.0) 
+	high_shelf_container.rotation_degrees = Vector3(0, -90, 0) 
+	
+	var shelf_wood_mat_dark := StandardMaterial3D.new()
+	shelf_wood_mat_dark.albedo_color = Color(0.25, 0.18, 0.1) 
+	shelf_wood_mat_dark.roughness = 0.65
+	
+	var num_shelves_high = 5
+	var shelf_spacing = (shelf_height - 0.05) / float(num_shelves_high)
+	
+	# Marco vertical (Izquierda)
+	var support_ll := MeshInstance3D.new()
+	high_shelf_container.add_child(support_ll)
+	support_ll.mesh = BoxMesh.new()
+	support_ll.scale = Vector3(0.1, shelf_height, shelf_depth)
+	support_ll.position = Vector3(-shelf_width/2.0 + 0.05, shelf_height/2.0, 0)
+	support_ll.material_override = shelf_wood_mat_dark
+
+	# Marco vertical (Derecha)
+	var support_rr := MeshInstance3D.new()
+	high_shelf_container.add_child(support_rr)
+	support_rr.mesh = BoxMesh.new()
+	support_rr.scale = Vector3(0.1, shelf_height, shelf_depth)
+	support_rr.position = Vector3(shelf_width/2.0 - 0.05, shelf_height/2.0, 0)
+	support_rr.material_override = shelf_wood_mat_dark
+	
+	# Estantes (Plank)
+	for i in range(num_shelves_high):
+		var y_pos = 0.05 + float(i) * shelf_spacing
+		var shelf_plank := MeshInstance3D.new()
+		high_shelf_container.add_child(shelf_plank)
+		shelf_plank.mesh = BoxMesh.new()
+		shelf_plank.scale = Vector3(shelf_width, 0.05, shelf_depth)
+		shelf_plank.position = Vector3(0, y_pos, 0)
+		shelf_plank.material_override = shelf_wood_mat_dark
+		
+		# Añadir libros de decoración
+		if i == 0:
+			_create_book(0.4, Color(0.9, 0.4, 0.1), -1.3, y_pos, high_shelf_container)
+			_create_book(0.45, Color(0.1, 0.4, 0.9), -1.1, y_pos, high_shelf_container)
+			_create_book(0.35, Color(0.5, 0.8, 0.5), -0.9, y_pos, high_shelf_container)
+			_create_book(0.4, Color(0.7, 0.5, 0.2), -0.7, y_pos, high_shelf_container)
+		elif i == 1:
+			_create_book(0.45, Color(0.1, 0.5, 0.7), 0.0, y_pos, high_shelf_container)
+			_create_book(0.3, Color(0.7, 0.7, 0.7), 0.2, y_pos, high_shelf_container)
+			_create_book(0.5, Color(0.2, 0.8, 0.5), 0.5, y_pos, high_shelf_container)
+			_create_book(0.3, Color(0.8, 0.1, 0.4), 0.8, y_pos, high_shelf_container)
+		elif i == 2:
+			_create_book(0.4, Color(0.5, 0.2, 0.8), -1.4, y_pos, high_shelf_container)
+			_create_book(0.5, Color(0.8, 0.2, 0.2), -1.2, y_pos, high_shelf_container)
+			_create_book(0.35, Color(0.1, 0.1, 0.1), 0.2, y_pos, high_shelf_container)
+			_create_book(0.4, Color(0.6, 0.6, 0.1), 1.0, y_pos, high_shelf_container)
+		elif i == 3:
+			_create_book(0.3, Color(0.5, 0.2, 0.8), 0.4, y_pos, high_shelf_container)
+			_create_book(0.5, Color(0.2, 0.8, 0.5), 0.6, y_pos, high_shelf_container)
+			_create_book(0.45, Color(0.9, 0.1, 0.9), 1.2, y_pos, high_shelf_container)
+		
+	
+	# --- Estantería Pequeña con Libros (PARED TRASERA) ---
+	var shelf_wood_mat := StandardMaterial3D.new()
+	shelf_wood_mat.albedo_color = Color(0.35, 0.25, 0.15)
+	shelf_wood_mat.roughness = 0.7
+	
+	var shelf_container := Node3D.new()
+	room.add_child(shelf_container)
+	var shelf_x = -6.5
+	var shelf_z = -9.7
+	shelf_container.position = Vector3(shelf_x, 0, shelf_z)
+	
+	# Marco vertical (Izquierda)
+	var support_l := MeshInstance3D.new()
+	shelf_container.add_child(support_l)
+	support_l.mesh = BoxMesh.new()
+	support_l.scale = Vector3(0.1, 2.0, 0.4)
+	support_l.position = Vector3(-0.7, 1.0, 0)
+	support_l.material_override = shelf_wood_mat
+
+	# Marco vertical (Derecha)
+	var support_r := MeshInstance3D.new()
+	shelf_container.add_child(support_r)
+	support_r.mesh = BoxMesh.new()
+	support_r.scale = Vector3(0.1, 2.0, 0.4)
+	support_r.position = Vector3(0.7, 1.0, 0)
+	support_r.material_override = shelf_wood_mat
+
+	# Estantes
+	var num_shelves = 4
+	for i in range(num_shelves):
+		var y_pos = 0.3 + float(i) * 0.5
+		var shelf_plank := MeshInstance3D.new()
+		shelf_container.add_child(shelf_plank)
+		shelf_plank.mesh = BoxMesh.new()
+		shelf_plank.scale = Vector3(1.5, 0.05, 0.4)
+		shelf_plank.position = Vector3(0, y_pos, 0)
+		shelf_plank.material_override = shelf_wood_mat
+		
+		# === Añadir Libros al estante (manteniendo la planta) ===
+		if i == 0: 
+			_create_book(0.4, Color.RED, -0.5, y_pos, shelf_container)
+			_create_book(0.45, Color.BLUE, -0.3, y_pos, shelf_container)
+			_create_book(0.35, Color.GREEN, -0.1, y_pos, shelf_container)
+		elif i == 1: 
+			_create_book(0.4, Color.YELLOW, 0.0, y_pos, shelf_container)
+			_create_book(0.3, Color.ORANGE, 0.2, y_pos, shelf_container)
+			_create_book(0.5, Color.PURPLE, 0.45, y_pos, shelf_container)
+		elif i == 2: 
+			# Maceta de la planta 
+			var pot := MeshInstance3D.new()
+			shelf_container.add_child(pot)
+			var pot_mesh := CylinderMesh.new()
+			pot_mesh.top_radius = 0.15
+			pot_mesh.bottom_radius = 0.12
+			pot_mesh.height = 0.3
+			pot.mesh = pot_mesh
+			pot.position = Vector3(-0.3, y_pos + 0.15, 0) 
+			var pot_mat := StandardMaterial3D.new()
+			pot_mat.albedo_color = Color(0.6, 0.3, 0.1) # Barro
+			pot_mat.roughness = 0.9
+			pot.material_override = pot_mat
+			
+			# Planta - Tallo/Hojas 
+			var leaves := MeshInstance3D.new()
+			shelf_container.add_child(leaves)
+			leaves.mesh = SphereMesh.new()
+			leaves.scale = Vector3(0.2, 0.25, 0.2)
+			leaves.position = pot.position + Vector3(0, 0.2, 0)
+			var leaves_mat := StandardMaterial3D.new()
+			leaves_mat.albedo_color = Color(0.1, 0.6, 0.1) # Verde vibrante
+			leaves_mat.roughness = 0.4
+			leaves.material_override = leaves_mat
+			
+			_create_book(0.4, Color.CYAN, 0.5, y_pos, shelf_container)
+
+	
+# =========================================================
+## Resto de funciones (build_table, slots, ui, etc.)
+# =========================================================
+
+func _build_table():
+	var table := Node3D.new()
+	add_child(table)
+
+	table_top = MeshInstance3D.new()
+	table.add_child(table_top)
+	table_top.mesh = BoxMesh.new()
+	table_top.scale = Vector3(TABLE_WIDTH, TABLE_HEIGHT, TABLE_DEPTH)  
+	table_top.position = Vector3(0, TABLE_Y_POS, 0)
+	
+	table_top_material = StandardMaterial3D.new() 
+	table_top_material.albedo_color = Color(0.4, 0.25, 0.15) 
+	table_top_material.roughness = 0.85 
+	table_top_material.metallic = 0.05  
+	
+	var wood_noise := FastNoiseLite.new() 
+	wood_noise.noise_type = FastNoiseLite.TYPE_SIMPLEX_SMOOTH
+	wood_noise.frequency = 0.08 
+	wood_noise.fractal_octaves = 4
+	
+	var noise_tex := NoiseTexture2D.new() 
+	noise_tex.set_noise(wood_noise) 
+	noise_tex.width = 512
+	noise_tex.height = 512
+	
+	table_top_material.albedo_texture = noise_tex
+	table_top_material.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS
+	
+	table_top_material.uv1_scale = Vector3(4.0, 1.0, 4.0) 
+	
+	table_top_material.normal_enabled = true
+	table_top_material.normal_texture = noise_tex
+	table_top_material.normal_scale = 0.2 
+	
+	table_top.material_override = table_top_material
+
+	var w2 = TABLE_WIDTH / 2.0 - 0.05
+	var d2 = TABLE_DEPTH / 2.0 - 0.05
+	_add_leg(table, Vector3(-w2, TABLE_Y_POS/2.0, -d2))
+	_add_leg(table, Vector3(w2, TABLE_Y_POS/2.0, -d2))
+	_add_leg(table, Vector3(-w2, TABLE_Y_POS/2.0, d2))
+	_add_leg(table, Vector3(w2, TABLE_Y_POS/2.0, d2))
+	
+func _add_leg(parent: Node, pos: Vector3):
+	var leg := MeshInstance3D.new()
+	parent.add_child(leg)
+	var cy := CylinderMesh.new()
+	cy.top_radius = 0.06
+	cy.bottom_radius = 0.06
+	cy.height = TABLE_Y_POS * 2  
+	leg.mesh = cy
+	leg.position = pos
+	var mat := StandardMaterial3D.new()
+	mat.albedo_color = Color(0.35, 0.18, 0.08)  
+	mat.roughness = 0.8
+	leg.material_override = mat
+
+# =========================================================
+## 📍 SLOTS / MARCADOR 
+# =========================================================
+func _build_slots():
+	slots.clear()
+	var cols := 10  
+	var rows := 10
+	
+	var x_limit = (TABLE_WIDTH / 2.0) - 0.2
+	var z_limit = (TABLE_DEPTH / 2.0) - 0.2
+	
+	for r in range(rows):
+		for c in range(cols):
+			var x: float = lerp(-x_limit, x_limit, float(c) / float(cols - 1))
+			var z: float = lerp(-z_limit, z_limit, float(r) / float(rows - 1)) + SLOT_Z_OFFSET
+			slots.append(Vector3(x, FIGURE_CENTER_Y, z))
+
+func _build_marker():
+	pass
+
+
+# =========================================================
+## 🖥 UI (MODO BORRAR AÑADIDO)
+# =========================================================
+func _build_ui():
+	ui_layer = CanvasLayer.new()
+	add_child(ui_layer)
+
+	var p := Panel.new()
+	ui_layer.add_child(p)
+	p.position = Vector2(12, 12)
+	p.size = Vector2(360, 400) 
+	var bg := StyleBoxFlat.new()
+	bg.bg_color = Color(0,0,0,0.55)
+	bg.corner_radius_top_left = 12
+	bg.corner_radius_top_right = 12
+	bg.corner_radius_bottom_left = 12
+	bg.corner_radius_bottom_right = 12
+	p.add_theme_stylebox_override(\"panel\", bg)
+	side_panel = p
+
+	var y := 10.0
+
+	var t1 := Label.new()
+	t1.text = \"Figuras (scroll):\"
+	t1.position = Vector2(10, y)
+	side_panel.add_child(t1)
+	y += 18
+
+	list_shapes = ItemList.new()
+	list_shapes.position = Vector2(10, y)
+	list_shapes.size = Vector2(340, 200) 
+	list_shapes.select_mode = ItemList.SELECT_SINGLE
+	for s in _shape_names():
+		list_shapes.add_item(s)
+	list_shapes.select(0)
+	list_shapes.item_selected.connect(_on_shape_or_color_changed)
+	side_panel.add_child(list_shapes)
+
+	y = 210 + 30.0 
+
+	var lcol := Label.new()
+	lcol.text = \"Color:\"
+	lcol.position = Vector2(10, y)
+	side_panel.add_child(lcol)
+
+	opt_color = OptionButton.new()
+	opt_color.position = Vector2(70, y - 2)
+	opt_color.size = Vector2(280, 26)
+	for c in _color_names():
+		opt_color.add_item(c)
+	opt_color.select(2) 
+	opt_color.item_selected.connect(_on_shape_or_color_changed)
+	side_panel.add_child(opt_color)
+	
+	y += 40.0 
+
+	btn_generate = Button.new()
+	btn_generate.text = \"Generar\"
+	btn_generate.position = Vector2(10, y)
+	btn_generate.size = Vector2(110, 30)
+	btn_generate.pressed.connect(_on_generate)
+	side_panel.add_child(btn_generate)
+
+	btn_delete = Button.new()
+	btn_delete.text = \"Borrar todo\"
+	btn_delete.position = Vector2(130, y)
+	btn_delete.size = Vector2(110, 30)
+	btn_delete.pressed.connect(_on_delete_all)
+	side_panel.add_child(btn_delete)
+	
+	y += 40.0 
+
+	btn_toggle_delete = Button.new()
+	btn_toggle_delete.text = \"Modo Borrar: OFF (Clic en figura)\"
+	btn_toggle_delete.position = Vector2(10, y)
+	btn_toggle_delete.size = Vector2(340, 30)
+	btn_toggle_delete.pressed.connect(_on_toggle_delete_mode)
+	side_panel.add_child(btn_toggle_delete)
+
+# =========================================================
+## ⚙ GENERACIÓN / EVENTOS
+# =========================================================
+
+func _on_toggle_delete_mode():
+	is_deleting_mode = not is_deleting_mode
+	if is_deleting_mode:
+		btn_toggle_delete.text = \"Modo Borrar: ON (Haz clic en una figura)\"
+		is_orbiting = false
+		is_panning = false
+	else:
+		btn_toggle_delete.text = \"Modo Borrar: OFF (Clic en figura)\"
+
+func _on_generate():
+	if shapes.size() >= MAX_SHAPES: 
+		return
+	
+	var idx := shapes.size()
+	var shape_code: int = list_shapes.get_selected_items()[0]
+	var color_id := opt_color.get_selected_id()
+	
+	var node := _make_shape(shape_code) 
+	node.set_meta(\"shape_index\", idx) 
+	
+	if node is StaticBody3D:
+		var mesh_visual = node.get_child(0) 
+		if mesh_visual is MeshInstance3D:
+			_apply_appearance(mesh_visual, color_id)
+			mesh_visual.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+			
+	elif node is CSGCombiner3D: 
+		_apply_csg_appearance(node, color_id)
+		node.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+		
+	node.scale = Vector3.ONE * 0.32
+	add_child(node)
+	
+	if idx < slots.size():
+		node.global_position = slots[idx]
+	else:
+		node.global_position = slots[slots.size() - 1] + Vector3(0.0, float(idx - slots.size()) * 0.01, 0.0) 
+		
+	shapes.append(node)
+	_update_ghost_position() 
+
+func _on_delete_all():
+	for s in shapes:
+		s.queue_free()
+	shapes.clear()
+	_update_ghost_position() 
+
+func _on_shape_or_color_changed(_id := 0):
+	_refresh_preview()
+
+func _delete_shape_at_index(index: int):
+	if index < 0 or index >= shapes.size():
+		return
+
+	var shape_to_delete = shapes[index]
+	shape_to_delete.queue_free()
+	shapes.remove_at(index)
+	
+	for i in range(index, shapes.size()):
+		var shape = shapes[i]
+		
+		if i < slots.size():
+			shape.global_position = slots[i]
+		else:
+			shape.global_position = slots[slots.size() - 1] + Vector3(0.0, float(i - slots.size()) * 0.01, 0.0)
+			
+		shape.set_meta(\"shape_index\", i) 
+
+	_update_ghost_position()
+
+# =========================================================
+## 🖱 INPUT / DETECCIÓN DE CLICS EN 3D
+# =========================================================
+
+func _input(event):
+	if is_deleting_mode: 
+		if event is InputEventMouseButton and event.button_index == MOUSE_BUTTON_LEFT and event.pressed:
+			var from = cam.project_ray_origin(event.position)
+			var to = from + cam.project_ray_normal(event.position) * 1000.0
+			
+			var space = get_world_3d().direct_space_state
+			var query = PhysicsRayQueryParameters3D.create(from, to)
+			var result = space.intersect_ray(query)
+			
+			if result:
+				var clicked_object = result.collider
+				var parent_object = clicked_object
+				while parent_object and parent_object != self:
+					if parent_object.has_meta(\"shape_index\"):
+						var index_to_delete = parent_object.get_meta(\"shape_index\")
+						_delete_shape_at_index(index_to_delete)
+						_on_toggle_delete_mode() 
+						get_viewport().set_input_as_handled()
+						return
+					parent_object = parent_object.get_parent()
+			
+			_on_toggle_delete_mode()
+			get_viewport().set_input_as_handled()
+			return
+			
+	_unhandled_input(event)
+
+# =========================================================
+## OTRAS FUNCIONES (GEOMETRÍA Y COLISIÓN)
+# =========================================================
+
+func _shape_names() -> Array[String]:
+	return [
+		\"Esfera\", \"Barra Horizontal\", \"Barra Vertical\", \"Triángulo\", \"Cuadrado\",
+		\"Pentágono\", \"Hexágono\", \"Heptágono\", \"Octógono\", \"Eneágono\",
+		\"Paréntesis Izquierdo\", \"Paréntesis Derecho\", \"Donut\" 
+	]
+
+func _make_shape_mesh(code: int) -> Node3D:
+	var mi := MeshInstance3D.new()
+	match code:
+		0: mi.mesh = SphereMesh.new()
+		1: 
+			var c := CylinderMesh.new()
+			c.height = 1.0
+			c.top_radius = 0.06
+			c.bottom_radius = 0.06
+			mi.mesh = c
+			mi.rotate_z(PI/2.0)
+		2: 
+			var c := CylinderMesh.new()
+			c.height = 1.0
+			c.top_radius = 0.06
+			c.bottom_radius = 0.06
+			mi.mesh = c
+			mi.rotate_x(PI/2.0)
+		3: 
+			var cone := CylinderMesh.new()
+			cone.top_radius = 0.0  
+			cone.bottom_radius = 0.5  
+			cone.height = 1.0
+			cone.radial_segments = 4  
+			mi.mesh = cone
+			mi.rotate_y(PI/4.0)  
+		4: mi.mesh = BoxMesh.new()
+		5, 6, 7, 8, 9: 
+			var poly := CylinderMesh.new()
+			poly.top_radius = 0.5
+			poly.bottom_radius = 0.5
+			poly.height = 1.0
+			poly.radial_segments = code
+			mi.mesh = poly
+		10: 
+			var c := CylinderMesh.new()
+			c.height = 1.0  
+			c.top_radius = 0.08
+			c.bottom_radius = 0.08
+			c.radial_segments = 8  
+			mi.mesh = c
+			mi.rotate_x(PI/2.0)
+			mi.rotate_y(deg_to_rad(30.0))
+		11: 
+			var c := CylinderMesh.new()
+			c.height = 1.0  
+			c.top_radius = 0.08
+			c.bottom_radius = 0.08
+			c.radial_segments = 8
+			mi.mesh = c
+			mi.rotate_x(PI/2.0)
+			mi.rotate_y(deg_to_rad(-30.0))
+		12: 
+			var torus := TorusMesh.new()
+			torus.outer_radius = 0.5  
+			torus.inner_radius = 0.15
+			mi.mesh = torus
+			# CORRECCIÓN DE ERROR: Rotar el MeshInstance3D (mi), no el Mesh (torus).
+			mi.rotate_x(PI/2.0) 
+		_: mi.mesh = BoxMesh.new()
+			
+	return mi
+
+func _make_shape(code: int) -> Node3D:
+	var mesh_instance := _make_shape_mesh(code) as MeshInstance3D
+	var mesh := mesh_instance.mesh 
+	var body := StaticBody3D.new()
+	body.rotation = mesh_instance.rotation
+	mesh_instance.rotation = Vector3.ZERO 
+	body.add_child(mesh_instance)
+	
+	var collision_shape := CollisionShape3D.new()
+	collision_shape.shape = mesh.create_convex_shape() 
+	
+	if mesh is CylinderMesh and (code == 1 or code == 2 or code == 10 or code == 11):
+		var capsule_shape := CapsuleShape3D.new()
+		capsule_shape.radius = 0.06 
+		capsule_shape.height = 1.0 + (capsule_shape.radius * 2)
+		collision_shape.shape = capsule_shape
+
+	body.add_child(collision_shape)
+	return body
+
+func _color_names() -> Array[String]:
+	return [\"Rojo\",\"Verde\",\"Azul\",\"Amarillo\",\"Morado\",\"Naranja\",\"Blanco\",\"Negro\",\"Cian\",\"Magenta\"]
+
+func _make_color_from_id(id: int) -> Color:
+	match id:
+		0: return Color(1,0,0)
+		1: return Color(0,1,0)
+		2: return Color(0,0,1)
+		3: return Color(1,1,0)
+		4: return Color(0.55,0,0.9)
+		5: return Color(1,0.55,0.2)
+		6: return Color(1,1,1)
+		7: return Color(0.06,0.06,0.06)
+		8: return Color(0,1,1)
+		9: return Color(1,0,1)
+		_: return Color(0.8,0.8,0.8)
+		
+func _apply_material_settings(mat: StandardMaterial3D, color_id: int): 
+	var c := _make_color_from_id(color_id)
+	mat.albedo_color = c
+	mat.roughness = 0.25  
+	mat.metallic = 0.45  
+	mat.rim_enabled = true
+	mat.rim_tint = 0.9  
+	mat.ao_light_affect = 0.3  
+	
+	if color_id == 6: 
+		mat.albedo_color = Color(0.92, 0.92, 0.92)  
+		mat.metallic = 0.1
+		mat.roughness = 0.4  
+		mat.ao_light_affect = 0.8  
+		mat.rim = 0.5  
+		mat.rim_tint = 0.0  
+		# (Resto de colores...)
+	elif color_id == 7: 
+		mat.albedo_color = Color(0.15, 0.15, 0.15)
+		mat.metallic = 0.65
+		mat.roughness = 0.1
+		mat.rim = 0.5
+		mat.rim_tint = 0.95
+	
+	mat.transparency = BaseMaterial3D.TRANSPARENCY_DISABLED 
+	c.a = 1.0
+
+func _apply_appearance(mi: MeshInstance3D, color_id: int):  
+	var mat := StandardMaterial3D.new() 
+	_apply_material_settings(mat, color_id)
+	mi.material_override = mat
+
+func _apply_csg_appearance(csg: CSGCombiner3D, color_id: int):  
+	var mat := StandardMaterial3D.new() 
+	_apply_material_settings(mat, color_id)
+	csg.material = mat
+
+func _create_book(height: float, color: Color, x_offset: float, y_pos: float, parent: Node3D):
+	var book := MeshInstance3D.new()
+	parent.add_child(book)
+	book.mesh = BoxMesh.new()
+	book.scale = Vector3(0.15, height, 0.35) 
+	book.position = Vector3(x_offset, y_pos + height/2.0, 0)
+	var book_mat := StandardMaterial3D.new()
+	book_mat.albedo_color = color
+	book_mat.roughness = 0.7
+	book.material_override = book_mat
+
+# =========================================================
+## 📷 CÁMARA ORBITAL
+# =========================================================
+
+func _unhandled_input(ev: InputEvent) -> void:
+	if is_deleting_mode:
+		return
+		
+	if ev is InputEventMouseButton:
+		if ev.button_index == MOUSE_BUTTON_LEFT:
+			is_orbiting = ev.pressed
+		elif ev.button_index == MOUSE_BUTTON_RIGHT:
+			is_panning = ev.pressed
+		elif ev.button_index == MOUSE_BUTTON_WHEEL_UP and ev.pressed:
+			orbit_dist = max(2.0, orbit_dist - 0.5)
+			_update_camera_transform()
+		elif ev.button_index == MOUSE_BUTTON_WHEEL_DOWN and ev.pressed:
+			orbit_dist = min(12.0, orbit_dist + 0.5)
+			_update_camera_transform()
+	elif ev is InputEventMouseMotion:
+		if is_orbiting:
+			orbit_yaw -= ev.relative.x * 0.01
+			orbit_pitch = clamp(orbit_pitch - ev.relative.y * 0.01, -1.2, 1.2)
+			_update_camera_transform()
+		elif is_panning:
+			var right := Vector3.RIGHT.rotated(Vector3.UP, orbit_yaw)
+			var up := Vector3.UP
+			orbit_target -= right * ev.relative.x * 0.01
+			orbit_target += up * ev.relative.y * 0.01
+			_update_camera_transform()
+
+func _update_camera_transform():
+	var dir := Vector3(
+		cos(orbit_pitch) * cos(orbit_yaw),
+		sin(orbit_pitch),
+		cos(orbit_pitch) * sin(orbit_yaw)
+	)
+	cam.global_position = orbit_target + dir * orbit_dist
+	cam.look_at(orbit_target, Vector3.UP)
+	cam.current = true
+"
+
+[node name="Main" type="Node3D"]
+script = SubResource("GDScript_rxg2q")
