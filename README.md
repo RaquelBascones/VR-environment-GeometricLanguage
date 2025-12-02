@@ -6,7 +6,6 @@
 2. [Key Features](#2-key-features)
 3. [Scene Structure](#3-scene-structure)
 4. [Installation and Execution](#4-installation-and-execution)
-5. [Contact](#5-contact)
 
 ---
 
